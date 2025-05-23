@@ -24,6 +24,8 @@ from UAV import Environment
 def get_args():
     # Create argument parser
     parser = argparse.ArgumentParser()
+    parser.add_argument('--history-len', type=int, default=10,
+                        help="Number of past actions to feed into the Transformer")
     parser.add_argument("--exploration-noise", type=float, default=0.01) # default=0.01
     parser.add_argument('--algorithm', type=str, default='diffusion_opt')
     parser.add_argument('--seed', type=int, default=0)
@@ -82,27 +84,28 @@ def main(args=get_args()):
 
     # create actor
     actor_net = TransformerDenoiser(
-    state_dim=args.state_shape,
-    action_dim=args.action_shape,
-    hidden_dim=128,  # tweak as needed
-    n_heads=4,
-    n_layers=2
-)
+    state_dim   = args.state_shape,
+    action_dim  = args.action_shape,
+    hidden_dim  = 128,
+    n_heads     = 4,
+    n_layers    = 3,
+    dropout     = 0.1,
+    history_len = args.history_len,
+     ).to(args.device)
 
-    # Actor is a Diffusion model
+    # wrap actor in diffusion process
     actor = Diffusion(
-        state_dim=args.state_shape,
-        action_dim=args.action_shape,
-        model=actor_net,
-        max_action=args.max_action,
-        beta_schedule=args.beta_schedule,
-        n_timesteps=args.n_timesteps
+        state_dim     = args.state_shape,
+        action_dim    = args.action_shape,
+        model         = actor_net,
+        max_action    = args.max_action,
+        beta_schedule = args.beta_schedule,
+        n_timesteps   = args.n_timesteps,
+        clip_denoised  = True,
     ).to(args.device)
-    actor_optim = torch.optim.Adam(
-        actor.parameters(),
-        lr=args.actor_lr,
-        weight_decay=args.wd
-    )
+    actor_optim = torch.optim.Adam(actor.parameters(),
+                                   lr=args.actor_lr,
+                                   weight_decay=args.wd)
 
     # Create critic
     critic1 = DoubleCritic(
@@ -126,24 +129,24 @@ def main(args=get_args()):
         weight_decay=args.wd
     )
 
+     policy with history support
     policy = DiffusionOPT(
-        args.state_shape,
-        actor,
-        actor_optim,
-        args.action_shape,
-        critic1,
-        critic_optim1,
-        critic2,
-        critic_optim2,
-        # dist,
-        args.device,
-        tau=args.tau,
-        gamma=args.gamma,
-        estimation_step=args.n_step,
-        lr_decay=args.lr_decay,
-        lr_maxt=args.epoch,
-        expert_coef=args.expert_coef,
-        action_space=env.action_space,
+        state_dim      = args.state_shape,
+        actor          = actor,
+        actor_optim    = actor_optim,
+        action_dim     = args.action_shape,
+        critic1        = critic1,
+        critic_optim1  = critic_optim1,
+        critic2        = critic2,
+        critic_optim2  = critic_optim2,
+        device         = args.device,
+        tau            = args.tau,
+        gamma          = args.gamma,
+        estimation_step= args.n_step,
+        lr_decay       = args.lr_decay,
+        lr_maxt        = args.epoch,
+        expert_coef    = args.expert_coef,
+        history_len    = args.history_len,     # <-- pass history_len here too
     )
 
     total_steps = 0
@@ -233,7 +236,7 @@ def main(args=get_args()):
                 i_episode,                       
                 Reward/t,                   
                 env.avg_A,                    
-                env.avg_E,
+                env.avg_E[0],
                 total_actor_loss / t if t > 0 else 0,
                 total_critic_loss / t if t > 0 else 0,
                 # Bmin,                         
