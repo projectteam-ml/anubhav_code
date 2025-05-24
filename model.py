@@ -59,62 +59,100 @@ class MLP(nn.Module):
                                    self.parameters()]))
 
 class TransformerDenoiser(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128, n_heads=4, n_layers=3, dropout=0.1):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        dropout: float = 0.1,
+        history_len: int = 10,
+    ):
         super().__init__()
+        self.history_len = history_len
+        self.hidden_dim  = hidden_dim
 
-        # Embedding layers
+        # --- Embeddings ---
+        self.state_embed  = nn.Linear(state_dim, hidden_dim)
         self.action_embed = nn.Linear(action_dim, hidden_dim)
-        self.state_embed = nn.Linear(state_dim, hidden_dim)
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        # <-- swap in SinusoidalPosEmb here:
+        self.time_embed   = SinusoidalPosEmb(hidden_dim)
 
-        # Transformer encoder with PreNorm, GELU, and dropout
+        # Positional embeddings for [state, time, action_0…action_{H-1}]
+        self.pos_embedding = nn.Parameter(
+            torch.zeros(history_len + 2, hidden_dim)
+        )
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+        # --- Transformer Encoder (PreNorm + GELU + Dropout) ---
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
+            d_model         = hidden_dim,
+            nhead           = n_heads,
+            dim_feedforward = hidden_dim * 4,
+            dropout         = dropout,
+            activation      = "gelu",
+            batch_first     = True,
+            norm_first      = True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers = n_layers
+        )
 
-        # LayerNorm before output
+        # Final norm + deeper MLP head
         self.norm = nn.LayerNorm(hidden_dim)
-
-        # Output head: deeper and with residual capacity
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, action_dim),
-            nn.Tanh()
+            nn.Tanh(),
         )
 
-    def forward(self, x, t, s):
-        t = t.unsqueeze(-1).float()  # [batch, 1]
+    def forward(
+        self,
+        state: torch.Tensor,           # [B, state_dim]
+        t:     torch.Tensor,           # [B] or [B,1]
+        action_history: torch.Tensor,  # [B, H, action_dim]
+    ) -> torch.Tensor:
+        B, H, A = action_history.shape
+        assert H <= self.history_len, \
+            f"History length {H} exceeds max {self.history_len}"
 
-        # Embedding each input
-        x_embed = self.action_embed(x)
-        s_embed = self.state_embed(s)
-        t_embed = self.time_embed(t)
+        # --- Embed tokens ---
+        s_e = self.state_embed(state)                              # [B, D]
+        a_e = self.action_embed(action_history)                    # [B, H, D]
 
-        # Sequence: [batch, seq_len=3, hidden_dim]
-        sequence = torch.stack([x_embed, s_embed, t_embed], dim=1)
+        # Flatten t to shape [B]
+        if t.ndim > 1:
+            t_flat = t.squeeze(-1)
+        else:
+            t_flat = t
+        t_e = self.time_embed(t_flat)                              # [B, D]
 
-        # Transformer processing
-        transformer_out = self.transformer(sequence)
+        # --- Assemble [state, time, actions...] → [B, H+2, D] ---
+        seq = torch.cat([
+            s_e.unsqueeze(1),  # [B,1,D]
+            t_e.unsqueeze(1),  # [B,1,D]
+            a_e                 # [B,H,D]
+        ], dim=1)              # [B, H+2, D]
 
-        # Use mean pooling over the sequence
-        pooled = transformer_out.mean(dim=1)
+        # --- Add positional embeddings ---
+        pos = self.pos_embedding[: H + 2].unsqueeze(0)             # [1, H+2, D]
+        seq = seq + pos                                            # [B, H+2, D]
+
+        # --- Transformer (batch_first=True) → [B, H+2, D] ---
+        y = self.transformer(seq)
+
+        # --- Pool & normalize ---
+        pooled = y.mean(dim=1)    # mean over sequence dim → [B, D]
         pooled = self.norm(pooled)
 
+        # --- Output head → [B, action_dim] ---
         return self.output_head(pooled)
+
 
 
 class DoubleCritic(nn.Module):
